@@ -1,15 +1,14 @@
-#credit dena toh de ni dena toh mat de laadle ~ GPG
 import logging
 from logging.handlers import RotatingFileHandler
 
 LOG_FILE_NAME = "bot.log"
-PORT = '8000'
-OWNER_ID = 123456789
+PORT = '8064'
+OWNER_ID = 8287604537
 MSG_EFFECT = 5046509860389126442
 
 # VPLink URL Shortener Configuration
-VPLINK_API_TOKEN = "akenamebepuresososebandhadhaga"
-VPLINK_API_URL = "example.com"
+VPLINK_API_TOKEN = ""
+VPLINK_API_URL = "https://vplink.in/api"
 
 # URL Shortener Providers Configuration
 URL_SHORTENERS = {

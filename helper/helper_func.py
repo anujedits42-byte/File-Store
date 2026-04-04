@@ -57,6 +57,19 @@ async def decode(base64_string):
     string = string_bytes.decode("utf-8")
     return string
 
+import secrets as _secrets
+import string as _string
+
+def generate_token(length: int = 14) -> str:
+    """Generate a cryptographically secure random token (URL-safe, alphanumeric only)."""
+    alphabet = _string.ascii_letters + _string.digits  # a-z A-Z 0-9
+    return ''.join(_secrets.choice(alphabet) for _ in range(length))
+
+def is_token_format(s: str) -> bool:
+    """Check if string looks like a new-style token (alphanumeric, 12-16 chars, no special chars)."""
+    return s.isalnum() and 12 <= len(s) <= 16
+
+
 async def get_messages(client, message_ids, chat_id=None):
     messages = []
     total_messages = 0
@@ -81,9 +94,17 @@ async def get_messages(client, message_ids, chat_id=None):
     return messages
 
 async def get_message_id(client, message):
-    target_chat_id = getattr(client, 'db_channel_id', client.db)
+    # Build set of all valid DB channel IDs (primary + extras from settings)
+    primary_db_id = getattr(client, 'db_channel_id', None) or int(client.db)
+    try:
+        extra_channels = await client.mongodb.get_db_channels()
+    except Exception:
+        extra_channels = []
+    all_db_ids = {primary_db_id, *[int(ch) for ch in extra_channels]}
+    primary_channel = getattr(client, 'db_channel', None)
+
     if message.forward_from_chat:
-        if message.forward_from_chat.id == target_chat_id:
+        if message.forward_from_chat.id in all_db_ids:
             return message.forward_from_message_id
         else:
             return 0
@@ -97,10 +118,11 @@ async def get_message_id(client, message):
         channel_id = matches.group(1)
         msg_id = int(matches.group(2))
         if channel_id.isdigit():
-            if f"-100{channel_id}" == str(client.db):
+            numeric_id = int(f"-100{channel_id}")
+            if numeric_id in all_db_ids:
                 return msg_id
         else:
-            if channel_id == client.db_channel.username:
+            if primary_channel and channel_id == getattr(primary_channel, 'username', None):
                 return msg_id
     else:
         return 0
@@ -144,7 +166,8 @@ async def is_bot_admin(client, channel_id):
         return False, f"Unexpected error: {str(e)}"
 
 async def check_subscription(client, user_id):
-    """Check if a user is subscribed to all required channels."""
+    """Check if a user is subscribed to all required channels/groups."""
+    from pyrogram.errors import ChatAdminRequired
     statuses = {}
 
     for channel_id, (channel_name, channel_link, request, timer) in client.fsub_dict.items():
@@ -155,25 +178,39 @@ async def check_subscription(client, user_id):
                 continue
         try:
             user = await client.get_chat_member(channel_id, user_id)
-            statuses[channel_id] = user.status
+            # LEFT / BANNED count as not joined. RESTRICTED is a member in groups.
+            if user.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
+                statuses[channel_id] = ChatMemberStatus.BANNED
+            else:
+                statuses[channel_id] = user.status
         except UserNotParticipant:
+            statuses[channel_id] = ChatMemberStatus.BANNED
+        except ChatAdminRequired:
+            # Bot is not admin in the group — can't check membership
+            # Treat as unknown-but-blocking so user must verify manually
+            client.LOGGER(__name__, client.name).warning(
+                f"Bot needs admin rights to check membership in {channel_name}. "
+                f"Please make bot admin in the group."
+            )
             statuses[channel_id] = ChatMemberStatus.BANNED
         except Forbidden:
             client.LOGGER(__name__, client.name).warning(f"Bot lacks permission for {channel_name}.")
-            statuses[channel_id] = None
+            statuses[channel_id] = ChatMemberStatus.BANNED
         except Exception as e:
             client.LOGGER(__name__, client.name).warning(f"Error checking {channel_name}: {e}")
-            statuses[channel_id] = None
+            statuses[channel_id] = ChatMemberStatus.BANNED
 
     return statuses
 
 
 def is_user_subscribed(statuses):
-    """Check if user is subscribed to all channels."""
+    """Check if user is subscribed to all channels/groups."""
+    if not statuses:
+        return False
     return all(
-        status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
-        for status in statuses.values() if status is not None
-    ) and bool(statuses)
+        status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED}
+        for status in statuses.values()
+    )
 
 
 def force_sub(func):
@@ -196,16 +233,38 @@ def force_sub(func):
 
         if is_user_subscribed(statuses):
             await msg.delete()
+            # 📊 Track join count for each channel the user is verified as a member of
+            import asyncio
+            async def _track_joins():
+                for cid, status in statuses.items():
+                    if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED):
+                        try:
+                            await client.mongodb.record_stat_user(cid, user_id)
+                        except Exception:
+                            pass
+            asyncio.create_task(_track_joins())
             return await func(client, message)
 
         # User is not subscribed to all channels
         buttons = []
-        channels_message = f"{client.messages.get('FSUB', '')}\n\n<b>ᴄʜᴀɴɴᴇʟ ꜱᴜʙꜱᴄʀɪᴘᴛɪᴏɴ ꜱᴛᴀᴛᴜꜱ:</b>\n\n"
+        fsub_template = client.messages.get('FSUB', '')
+        try:
+            fsub_text = fsub_template.format(
+                mention=message.from_user.mention,
+                first=message.from_user.first_name,
+                last=message.from_user.last_name or '',
+                username=f"@{message.from_user.username}" if message.from_user.username else '',
+                id=message.from_user.id
+            )
+        except Exception:
+            fsub_text = fsub_template
+        channels_message = f"{fsub_text}\n\n<b>ᴄʜᴀɴɴᴇʟ ꜱᴜʙꜱᴄʀɪᴘᴛɪᴏɴ ꜱᴛᴀᴛᴜꜱ:</b>\n\n"
 
         status_emojis = {
             ChatMemberStatus.MEMBER: "✅",
             ChatMemberStatus.ADMINISTRATOR: "🛡️",
             ChatMemberStatus.OWNER: "👑",
+            ChatMemberStatus.RESTRICTED: "✅",
             ChatMemberStatus.BANNED: "❌",
             None: "⚠️"
         }
@@ -224,7 +283,7 @@ def force_sub(func):
                     creates_join_request=request
                 )
                 channel_link = invite.invite_link
-            if status not in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
+            if status not in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED}:
                 buttons.append(InlineKeyboardButton(channel_name, url=channel_link))
         
         # Add "Try Again" button if needed
@@ -261,8 +320,13 @@ async def delete_files(messages, client, k, enter):
         command = enter.split(" ")
         command_part = command[1] if len(command) > 1 else None
         
-        
         keyboard = None
+        if command_part:
+            url = f"https://t.me/{client.username}?start={command_part}"
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Try Again", url=url)]
+            ])
+            
     await k.edit_text(
         "<blockquote><b><i>Your Video / File Is Successfully Deleted ✅</i></b></blockquote>",
         reply_markup=keyboard

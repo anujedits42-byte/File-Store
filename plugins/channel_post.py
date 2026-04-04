@@ -28,13 +28,23 @@ async def new_post(client: Client, message: Message):
         return
 
     channel_id = message.chat.id
-    converted_id = message.id * abs(channel_id)
-    string = f"get-{converted_id}"
-    base64_string = await encode(string)
-    link = f"https://t.me/{client.username}?start={base64_string}"
+    msg_id = message.id
+
+    # 🔐 Generate hybrid token (stored in MongoDB)
+    try:
+        token = await client.mongodb.create_file_token(channel_id, msg_id)
+        link = f"https://t.me/{client.username}?start={token}"
+    except Exception as e:
+        print(f"Token creation failed in channel_post: {e}")
+        # Fallback to Base64 if token creation fails
+        converted_id = msg_id * abs(channel_id)
+        base64_string = await encode(f"get-{converted_id}")
+        link = f"https://t.me/{client.username}?start={base64_string}"
+
     reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Share URL", url=f'https://telegram.me/share/url?url={link}')]])
     try:
         await message.edit_reply_markup(reply_markup)
     except Exception as e:
         print(e)
         pass
+

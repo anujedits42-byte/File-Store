@@ -23,6 +23,8 @@ class MongoDB:
             instance.bot_config = instance.db["bot_config"]  # Bot configuration
             instance.batch_groups = instance.db["batch_groups"]  # Auto-batch groups
             instance.pending_files = instance.db["pending_files"]  # Files pending grouping
+            instance.file_tokens = instance.db["file_tokens"]  # Hybrid token system
+            instance.rate_limits = instance.db["rate_limits"]  # Rate limiting
             cls._instances[(uri, db_name)] = instance
         return cls._instances[(uri, db_name)]
 
@@ -204,6 +206,84 @@ class MongoDB:
     async def get_premium_users(self) -> list[int]:
         cursor = self.user_data.find({'is_premium': True})
         return [doc['_id'] async for doc in cursor]
+
+    # =====================================================
+    # HYBRID TOKEN LINK SYSTEM
+    # =====================================================
+
+    async def ensure_token_indexes(self):
+        """Create MongoDB indexes for fast token lookup (call once on startup)."""
+        # Fix: Drop incorrect 'token' index if it exists (caused duplicate null error)
+        try:
+            await self.file_tokens.drop_index("token_1")
+        except:
+            pass
+            
+        # _id is automatically indexed and unique, so we don't need another unique index on token
+        await self.file_tokens.create_index("created_at")  # For TTL cleanup
+        await self.rate_limits.create_index("user_id")
+        await self.rate_limits.create_index("window_start")  # For cleanup
+
+    async def create_file_token(self, channel_id: int, msg_id: int, is_batch: bool = False, end_msg_id: int = None) -> str:
+        """Generate a unique random token and store it in MongoDB. Returns the token."""
+        import secrets
+        import string
+        from datetime import datetime
+        
+        alphabet = string.ascii_letters + string.digits
+        
+        for _ in range(10):  # Retry up to 10 times on collision
+            token = ''.join(secrets.choice(alphabet) for _ in range(14))
+            try:
+                await self.file_tokens.insert_one({
+                    "_id": token,
+                    "channel_id": channel_id,
+                    "msg_id": msg_id,
+                    "end_msg_id": end_msg_id,  # Store end ID for ranges
+                    "is_batch": is_batch,
+                    "created_at": datetime.utcnow(),
+                    "clicks": 0
+                })
+                return token
+            except Exception: # Duplicate key (_id collision)
+                continue
+        raise RuntimeError("Failed to generate unique token after 10 attempts")
+
+    async def resolve_file_token(self, token: str) -> dict | None:
+        """Resolve a token to {channel_id, msg_id}. Returns None if not found."""
+        await self.file_tokens.update_one(
+            {"_id": token},
+            {"$inc": {"clicks": 1}}
+        )
+        doc = await self.file_tokens.find_one({"_id": token})
+        return doc  # Returns full doc or None
+
+    async def record_invalid_token_attempt(self, user_id: int):
+        """Record an invalid token attempt for rate limiting."""
+        from datetime import datetime
+        now = datetime.utcnow()
+        window_start = now.replace(second=0, microsecond=0)  # 1-minute window
+        
+        await self.rate_limits.update_one(
+            {"user_id": user_id, "window_start": window_start},
+            {"$inc": {"attempts": 1}, "$setOnInsert": {"created_at": now}},
+            upsert=True
+        )
+
+    async def is_token_rate_limited(self, user_id: int, max_attempts: int = 10) -> bool:
+        """Check if user has exceeded invalid token attempts in the last 60 seconds."""
+        from datetime import datetime, timedelta
+        now = datetime.utcnow()
+        window_start = now - timedelta(minutes=1)
+        
+        cursor = self.rate_limits.find({
+            "user_id": user_id,
+            "window_start": {"$gte": window_start}
+        })
+        total = 0
+        async for doc in cursor:
+            total += doc.get("attempts", 0)
+        return total >= max_attempts
 
     # =====================================================
     # BROADCAST TTL JOBS
@@ -472,3 +552,83 @@ class MongoDB:
         await self.pending_files.delete_many({
             'timestamp': {'$lt': threshold}
         })
+
+    # ─────────────────────────────────────────────
+    #  ForceSub Join Tracking (join-request channels)
+    # ─────────────────────────────────────────────
+    async def add_channel_user(self, channel_id: int, user_id: int):
+        """Record that a user sent a join request to channel_id (used by join_request.py)."""
+        await self.bot_config.update_one(
+            {'_id': f'fsub_join_{channel_id}'},
+            {'$addToSet': {'users': user_id}},
+            upsert=True
+        )
+
+    async def is_user_in_channel(self, channel_id: int, user_id: int) -> bool:
+        """Check if a user previously sent a join request to channel_id (request=True channels)."""
+        doc = await self.bot_config.find_one({'_id': f'fsub_join_{channel_id}'})
+        if doc and 'users' in doc:
+            return user_id in doc['users']
+        return False
+
+    # ─────────────────────────────────────────────
+    #  ForceSub Join Count Stats (all channels)
+    # ─────────────────────────────────────────────
+    async def record_stat_user(self, channel_id: int, user_id: int):
+        """Record a verified join for stats purposes. Separate from join-request tracking."""
+        await self.bot_config.update_one(
+            {'_id': f'fsub_stat_{channel_id}'},
+            {'$addToSet': {'users': user_id}},
+            upsert=True
+        )
+
+    async def get_channel_join_count(self, channel_id: int) -> int:
+        """Return how many unique users were verified as joined via this bot (for stats panel)."""
+        # Count from both stat records (direct joins) and join-request records
+        count = 0
+        for key in [f'fsub_stat_{channel_id}', f'fsub_join_{channel_id}']:
+            doc = await self.bot_config.find_one({'_id': key})
+            if doc and 'users' in doc:
+                count += len(doc['users'])
+        return count
+
+
+    # ─────────────────────────────────────────────
+    #  ForceSub Channel Persistence
+    # ─────────────────────────────────────────────
+    async def save_fsub_channels(self, fsub_data: dict):
+        """Persist fsub_dict to MongoDB. fsub_data = {channel_id: [name, link, req, limit]}"""
+        entries = [
+            {'id': cid, 'info': info}
+            for cid, info in fsub_data.items()
+        ]
+        await self.bot_config.update_one(
+            {'_id': 'fsub_channels'},
+            {'$set': {'channels': entries}},
+            upsert=True
+        )
+
+    async def load_fsub_channels(self) -> dict | None:
+        """Load persisted fsub_dict. Returns None if not in DB (fall back to setup.json)."""
+        doc = await self.bot_config.find_one({'_id': 'fsub_channels'})
+        if not doc or 'channels' not in doc:
+            return None
+        return {entry['id']: entry['info'] for entry in doc['channels']}
+
+    # ─────────────────────────────────────────────
+    #  Admin Persistence
+    # ─────────────────────────────────────────────
+    async def save_admins(self, admins: list):
+        """Persist admin list to MongoDB."""
+        await self.bot_config.update_one(
+            {'_id': 'bot_admins'},
+            {'$set': {'admins': admins}},
+            upsert=True
+        )
+
+    async def load_admins(self) -> list | None:
+        """Load persisted admin list. Returns None if not in DB (fall back to setup.json)."""
+        doc = await self.bot_config.find_one({'_id': 'bot_admins'})
+        if not doc or 'admins' not in doc:
+            return None
+        return doc['admins']

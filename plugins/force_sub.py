@@ -49,6 +49,8 @@ async def add_fsub(client: Client, query: CallbackQuery):
             chat_link = await client.create_chat_invite_link(channel_id, creates_join_request=request)
             link = chat_link.invite_link
             client.fsub_dict[channel_id] = [name, link, request, timer]
+        # 💾 Persist to DB
+        await client.mongodb.save_fsub_channels(client.fsub_dict)
         await fsub(client, query)
         return await ask_channel_info.reply(f"__Channel with name: `{name.strip()}` is added as a force sub channel!!__")
     except Exception as e:
@@ -64,6 +66,8 @@ async def rm_fsub(client: Client, query: CallbackQuery):
             return await ask_channel_info.reply("**This channel id is not in force sub list!**")
         
         client.fsub_dict.pop(channel_id)
+        # 💾 Persist to DB
+        await client.mongodb.save_fsub_channels(client.fsub_dict)
         await fsub(client, query)
         return await ask_channel_info.reply(f"__Channel with id: `{channel_id}` has been removed as a force sub channel!!__")
     except Exception as e:

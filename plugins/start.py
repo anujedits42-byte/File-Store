@@ -53,9 +53,8 @@ async def start_command(client: Client, message: Message):
         except IndexError:
             return
 
-        # If it's a batch link, let the batch_handler handle it (Group 1)
-        if base64_string.startswith("batch_"):
-            return
+        # Early return removed to allow valid handling of batch links
+
         
         # ============== REFERRAL SYSTEM ==============
         # Check if this is a referral link: /start ref_XXXXXXXX
@@ -80,10 +79,32 @@ async def start_command(client: Client, message: Message):
         # ---------------- TOKEN VERIFIED / SHORTENER SOLVED ----------------
         if "_" in base64_string:
             parts = base64_string.split("_", 1)
-            if len(parts) == 2:
+            # Handle batch_ID_TOKEN case where batch_ID might contain underscores? 
+            # No, batch_ID is hex. So splitting logic works.
+            # But wait, create_batch uses secrets.token_hex(8) -> "a1b2c3d4e5f6g7h8" (no underscores)
+            # So splitting by first "_" is fine if token is second part.
+            # BUT if original was "batch_XYZ", split gives "batch", "XYZ". 
+            # NO. "batch_XYZ_TOKEN". 
+            # split("_", 1) -> "batch", "XYZ_TOKEN". WRONG.
+            # We need to handle "batch_" prefix carefully.
+            
+            # If it starts with batch_, we assume format: batch_BATCHID_TOKEN
+            if base64_string.startswith("batch_"):
+                # expected: batch_{id}_{token}
+                # split("_") -> [batch, id, token]
+                parts = base64_string.split("_")
+                if len(parts) >= 3:
+                     # reconstruct original: batch_{id}
+                     original_base64 = f"{parts[0]}_{parts[1]}"
+                     access_token = parts[2]
+                else:
+                    # Fallback or invalid
+                    pass
+            elif len(parts) == 2:
                 original_base64 = parts[0]
                 access_token = parts[1]
 
+            if access_token:
                 # Check if verification is enabled
                 token_verification_enabled = await client.mongodb.get_bot_config('token_verification_enabled', True)
 
@@ -175,122 +196,104 @@ async def start_command(client: Client, message: Message):
 
                     # Grant temporary access to bypass the check below
                     is_premium_user = True
+                    
+                    # If this was a BATCH link, we need to manually trigger the batch handler
+                    if original_base64.startswith("batch_"):
+                         batch_id = original_base64.replace("batch_", "").strip()
+                         from plugins.batch_handler import process_batch
+                         await process_batch(client, message, batch_id)
+                         message.stop_propagation()
+                         return
+
                     # Fall through to file sending logic...
 
-        # -------------------------- DECODE FILE --------------------------
-        try:
-            string = await decode(original_base64)
-            argument = string.split("-")
-        except Exception:
-            return
+        # -------------------------- HYBRID TOKEN / BASE64 DECODE --------------------------
+        # 🔐 NEW: Check if it's a token-format link (alphanumeric, 12-16 chars)
+        from helper.helper_func import is_token_format
         
-        ids = []
-        custom_chat_id = None
+        # Batch links are NOT tokens in DB, they are IDs to be resolved by handler or Shortener
+        is_batch = original_base64.startswith("batch_")
         
-        if len(argument) == 3:
+        if not is_batch and is_token_format(original_base64):
+            # ---- Rate limit check ----
+            if await client.mongodb.is_token_rate_limited(user_id):
+                return await message.reply(
+                    f"<blockquote>⏳ <b>{sc('too many invalid attempts')}</b></blockquote>\n"
+                    f"<blockquote><b>{sc('please wait a minute and try again')}</b></blockquote>"
+                )
+            
+            # ---- Resolve token from MongoDB ----
+            token_doc = await client.mongodb.resolve_file_token(original_base64)
+            
+            if not token_doc:
+                # Record invalid attempt for rate limiting
+                await client.mongodb.record_invalid_token_attempt(user_id)
+                return await message.reply(
+                    f"<blockquote>❌ <b>{sc('invalid or expired link')}</b></blockquote>\n"
+                    f"<blockquote><b>{sc('please get a new link')}</b></blockquote>"
+                )
+            
+            # ---- Token resolved! Build ids from token data ----
+            channel_id = token_doc["channel_id"]
+            start_msg_id = token_doc["msg_id"]
+            end_msg_id = token_doc.get("end_msg_id")
+            
+            if end_msg_id:
+                ids = range(start_msg_id, end_msg_id + 1)
+            else:
+                ids = [start_msg_id]
+                
+            custom_chat_id = channel_id
+            
+        elif is_batch:
+            # Raw Batch Link: Skip decoding (it's not base64) and fall through to Check/Shortener
+            ids = []
+            custom_chat_id = None
+        else:
+            # ---- OLD Base64 path (backward compatible) ----
             try:
-                # Check for New Format: get-CHANNEL_ID-MSG_ID
-                # Heuristic: Channel IDs (without -100) are usually smaller than the HUGE encoded IDs involved in multiplication?
-                # Or better: Try to interpret as multi-db first.
-                
-                # If it's a batch file link from our new handler, it is DEFINITELY get-CH-MSG.
-                # But what about legacy "Batch Range" links (get-START-END)?
-                # START = MSG_ID * DB_ID.
-                # DB_ID is -100... (negative). But `start` code uses `abs(db)`.
-                # So START is positive huge integer.
-                
-                val1 = int(argument[1])
-                val2 = int(argument[2])
-                
-                # If val2 is small (message ID), it's likely New Format.
-                # If val2 is HUGE (encoded), it's Old Format.
-                
-                # Typical Channel ID (without -100) ~ 10-15 digits.
-                # Typical Message ID ~ 1-6 digits.
-                # Typical Encoded ID (Msg * Ch) ~ 20+ digits.
-                
-                if val2 < 1000000: # Message ID < 1 Million (Safe assumption?)
-                    # New Format
-                    channel_id = val1
-                    msg_id = val2
-                    custom_chat_id = int(f"-100{channel_id}")
-                    ids = [msg_id]
-                else:
-                    # Old Format (Range)
-                    start = int(val1 / abs(client.db))
-                    end = int(val2 / abs(client.db))
-                    ids = range(start, end + 1) if start <= end else list(range(start, end - 1, -1))
-            except:
-                pass
-            try:
-                # Format: get-CHANNEL_ID-MSG_ID
-                # New Logic for Multi-DB
-                channel_id = int(argument[1])
-                msg_id = int(argument[2])
-                
-                # Check if it's a range or single file?
-                # The format get-CH-MSG implies single file.
-                # But existing logic `start = int(int(argument[1]) / abs(client.db))` implies the arguments are ENCODED IDs.
-                
-                # Wait, if I change the generation to `get-{channel_id}-{msg_id}`, then `argument[1]` is `channel_id`.
-                
-                # Let's support BOTH old and new formats.
-                # Old Format: get-START_ID-END_ID (where START_ID = REAL_ID * DB_ID)
-                # New Format: get-CHANNEL_ID-MSG_ID
-                
-                # Heuristic: 
-                # If argument[1] is a small number (channel ID 100xxxx), it might be a channel ID.
-                # If argument[1] is a HUGE number, it's an encoded ID.
-                
-                # Actually, `batch_handler` generates `get-{channel_id}-{msg_id}` now.
-                # So `argument` has 3 parts: ["get", "CHANNEL_ID", "MSG_ID"]
-                
-                arg1 = int(argument[1])
-                arg2 = int(argument[2])
-                
-                # If it's the old Range format (get-START-END), the numbers are likely HUGE.
-                # If it's the new Multi-DB format, arg1 is Channel ID, arg2 is Message ID.
-                
-                # Let's assume new format if arg1 < 100000000000000 (just a guess, or check logic)
-                
-                # BETTER APPROACH:
-                # The new `batch_handler` uses `get-{channel_id}-{msg_id}`.
-                # `channel_id` is clean (no -100).
-                
-                # Let's try to fetch assuming it's new format.
-                full_chat_id = int(f"-100{arg1}")
-                message_id = arg2
-                
-                # But wait, `get_messages` takes a LIST of IDs.
-                # And `ids` variable is expected to be a list of Message IDs.
-                # But existing code does: `messages = await get_messages(client, ids)`
-                # And `get_messages` uses `client.db` (Default DB).
-                
-                # WE NEED TO PASS `chat_id` to `get_messages`.
-                # But `get_messages` signature in `start.py` call doesn't support it yet (I just updated helper, but start.py calls it).
-                
-                # We need to change how `ids` is structured OR how `get_messages` is called.
-                
-                # If we have a single file from a specific channel:
-                ids = [message_id] # This is just the ID.
-                # But `get_messages` will use `client.db` by default!
-                
-                # We need to store the `chat_id` somewhere to use it later.
-                # Or call `get_messages` directly here with the explicit chat_id.
-                
-                custom_chat_id = full_chat_id
-                
-            except:
-                pass
-
-        elif len(argument) == 2:
-            try:
-                # Format: get-GENERATED_ID
-                # Old logic: int(argument[1]) / abs(client.db_channel.id)
-                # This only works for Default DB.
-                ids = [int(int(argument[1]) / abs(client.db))]
-            except:
+                string = await decode(original_base64)
+                argument = string.split("-")
+            except Exception:
                 return
+        
+            ids = []
+            custom_chat_id = None
+        
+            if len(argument) == 3:
+                try:
+                    val1 = int(argument[1])
+                    val2 = int(argument[2])
+                    
+                    if val2 < 1000000: # Message ID < 1 Million → New Format
+                        channel_id = val1
+                        msg_id = val2
+                        custom_chat_id = int(f"-100{channel_id}")
+                        ids = [msg_id]
+                    else:
+                        # Old Format (Range)
+                        start = int(val1 / abs(client.db))
+                        end = int(val2 / abs(client.db))
+                        ids = range(start, end + 1) if start <= end else list(range(start, end - 1, -1))
+                except:
+                    pass
+                try:
+                    arg1 = int(argument[1])
+                    arg2 = int(argument[2])
+                    full_chat_id = int(f"-100{arg1}")
+                    message_id = arg2
+                    ids = [message_id]
+                    custom_chat_id = full_chat_id
+                except:
+                    pass
+
+            elif len(argument) == 2:
+                try:
+                    # Format: get-GENERATED_ID (old single-file format)
+                    ids = [int(int(argument[1]) / abs(client.db))]
+                except:
+                    return
+
         
         # Check if credit system is enabled globally
         credit_system_enabled = await client.mongodb.is_credit_system_enabled()
@@ -334,6 +337,33 @@ async def start_command(client: Client, message: Message):
         if not is_premium_user and token_verification_enabled:
             temp_msg = await message.reply(f"🔄 **{sc('generating your link')}...**")
             
+            # ---------------- FETCH CONTENT NAME ----------------
+            content_name = ""
+            try:
+                if original_base64.startswith("batch_"):
+                    b_id = original_base64.replace("batch_", "").strip()
+                    batch = await client.mongodb.get_batch(b_id)
+                    if batch:
+                        content_name = f"📦 <b>{batch.get('base_name', 'Batch Pack')}</b>\n\n"
+                elif 'ids' in locals() and ids:
+                    # Use resolved IDs (Works for Token & Old Base64)
+                    try:
+                        t_msg_id = ids[0]
+                        t_chat_id = custom_chat_id if 'custom_chat_id' in locals() and custom_chat_id else client.db
+                        
+                        # Fetch message
+                        f_msg = await client.get_messages(t_chat_id, t_msg_id)
+                        if f_msg:
+                            if f_msg.document:
+                                content_name = f"🎬 <b>{f_msg.document.file_name}</b>\n\n"
+                            elif f_msg.caption:
+                                # Start of caption usually contains filename or title
+                                pass 
+                    except:
+                        pass
+            except Exception as e:
+                client.LOGGER(__name__, client.name).warning(f"Error fetching content name: {e}")
+            
             access_token = secrets.token_hex(16)
             await client.mongodb.create_access_token(user_id, original_base64, access_token)
             
@@ -343,6 +373,7 @@ async def start_command(client: Client, message: Message):
             await temp_msg.delete()
             
             premium_text = (
+                f"{content_name}"
                 f"<b>🔗 {sc('your file link')}:</b>\n\n"
                 f"<blockquote>👉 {sc('solve the shortener to unlock your file')}</blockquote>\n\n"
                 f"<b>💎 {sc('want direct access')}?</b> {sc('buy premium')}!"
@@ -361,11 +392,21 @@ async def start_command(client: Client, message: Message):
                 photo="https://i.ibb.co/FtnfS25/photo-2025-10-31-18-43-10-7567458335163678756.jpg",
                 caption=premium_text,
                 reply_markup=buttons,
-                protect_content=True  #  ✅ ADD THIS LINE
+                protect_content=True
             )
+            if original_base64.startswith("batch_"):
+                message.stop_propagation()
             return
         
         # ------------------ PREMIUM / CREDIT USERS: SEND FILE ------------------
+        
+        if original_base64.startswith("batch_"):
+             batch_id = original_base64.replace("batch_", "").strip()
+             from plugins.batch_handler import process_batch
+             await process_batch(client, message, batch_id)
+             message.stop_propagation()
+             return
+
         temp_msg = await message.reply(f"{sc('wait a sec')}..")
         
         try:
@@ -415,13 +456,12 @@ async def start_command(client: Client, message: Message):
 
     # ---------------- NORMAL /start UI ----------------
     buttons = [
-        [InlineKeyboardButton("💎 ᴘʀᴇᴍɪᴜᴍ ᴘʟᴀɴꜱ", callback_data="premium_plans")],
-        [InlineKeyboardButton("⌜ᴡᴇʙsᴇʀɪᴇs ɴᴇᴛᴡᴏʀᴋ⌟", url="https://t.me/Omniseries"),
+        [InlineKeyboardButton("⌜UPDATES⌟", url="https://t.me/Awakeners_bots"),
          InlineKeyboardButton("⌜ɴᴇᴛᴡᴏʀᴋ⌟", url="https://t.me/The_Mortals")],
         [InlineKeyboardButton("⌜ᴀʙᴏᴜᴛ⌟", callback_data="about"),
          InlineKeyboardButton("⌜ᴅᴇᴠ⌟", url="https://t.me/GPGMS0")]
     ]
-
+    
     if user_id in client.admins:
         buttons.insert(0, [InlineKeyboardButton("⌜ꜱᴇᴛᴛɪɴɢꜱ⌟", callback_data="settings")])
     

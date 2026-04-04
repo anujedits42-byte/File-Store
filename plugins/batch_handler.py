@@ -11,14 +11,18 @@ from helper.quality_detector import get_quality_priority
 @Client.on_message(filters.private & filters.text, group=1)
 async def batch_link_handler(client: Client, message: Message):
     """Handle batch link access"""
-    
     # Only handle batch_ links
     if not message.text or not message.text.startswith("/start batch_"):
         return
     
     text = message.text
     batch_id = text.replace("/start batch_", "").strip()
-    
+
+    # Reuse the logic
+    await process_batch(client, message, batch_id)
+
+async def process_batch(client: Client, message: Message, batch_id: str):
+    """Reusable batch processing logic"""
     # Get batch from database
     batch = await client.mongodb.get_batch(batch_id)
     
@@ -119,7 +123,7 @@ async def batch_link_handler(client: Client, message: Message):
             )
             # Run delete_files in background
             import asyncio
-            asyncio.create_task(delete_files(sent_msgs, client, warning, text))
+            asyncio.create_task(delete_files(sent_msgs, client, warning, message.text))
             
         return
 
@@ -151,9 +155,6 @@ async def batch_link_handler(client: Client, message: Message):
             callback_data=f"batchfile_{batch_id}_{file_id}"
         )])
         
-        # List entry (Episode Pack only)
-        # msg += f"└ **{quality}** - {filename}\n"
-    
     msg += f"\n{sc('select file to download')}"
     
     if not is_premium and user_credits == 0 and credit_system_enabled:
@@ -169,84 +170,81 @@ async def batch_link_handler(client: Client, message: Message):
 
 @Client.on_callback_query(filters.regex(r"^batchfile_"))
 async def batch_file_callback(client: Client, query):
-    """Handle batch file selection"""
-    
-    data = query.data.split("_")
-    batch_id = data[1]
-    file_id = data[2]
-    
+    """Handle batch file selection — directly send the chosen file"""
+
+    # Format: batchfile_{batch_id}_{file_id}
+    # batch_id is hex (no underscores), file_id is a plain message number
+    # Use rsplit on '_' with maxsplit=1 to safely extract the file_id from the end
+    raw = query.data  # e.g. "batchfile_a1b2c3d4e5f6_642"
+    prefix_with_batch = raw.rsplit("_", 1)  # ["batchfile_a1b2c3d4e5f6", "642"]
+    if len(prefix_with_batch) != 2:
+        await query.answer("❌ Invalid batch data", show_alert=True)
+        return
+
+    file_id_str = prefix_with_batch[1]  # "642"
+    batch_id = prefix_with_batch[0].replace("batchfile_", "", 1)  # "a1b2c3d4e5f6"
+
     user_id = query.from_user.id
-    
-    # Get the actual file message
+
     batch = await client.mongodb.get_batch(batch_id)
     if not batch:
-        await query.answer("❌ Batch expired", show_alert=True)
+        await query.answer("❌ Batch expired or not found", show_alert=True)
         return
-    
-    # Find the file
-    file_data = next((f for f in batch['files'] if f['file_id'] == file_id), None)
+
+    file_data = next((f for f in batch['files'] if str(f['file_id']) == file_id_str), None)
     if not file_data:
-        await query.answer("❌ File not found", show_alert=True)
+        await query.answer("❌ File not found in batch", show_alert=True)
         return
-    
-    # Redirect to normal file access with channel + file_id
-    # We need to encode the ID so start.py can decode it
-    # Pattern expected by start.py: "get-{id * channel_id}" (OR NEW PATTERN FOR MULTI DB)
-    
+
+    await query.answer()
+
+    msg_id = int(file_id_str)
+    channel_id = file_data.get('channel_id', client.db)
+
+    # Normalize channel_id to full negative int
     try:
-        msg_id = int(file_id)
-        # Use stored channel_id or default DB
-        channel_id = file_data.get('channel_id', client.db)
-        
-        # Ensure channel_id is positive integer for multiplication logic (Old Method)
-        # BUT wait! If we have multiple DBs, the logic "id * channel_id" is ambiguous if channel_id varies?
-        # Actually start.py logic: 
-        # decoded = base64_decode(token) -> "12345678"
-        # Since we can't easily reverse "id * channel_id" without knowing channel_id...
-        # Wait, start.py logic is FLAWED for multi-DB if it relies on a SINGLE client.db for decoding?
-        
-        # Let's check start.py logic.
-        # If start.py expects "get-INT", and tries to find "INT / client.db" or "INT / abs(client.db)"...
-        # If the channel_id is DIFFERENT, division will fail or give wrong Msg ID.
-        
-        # WE NEED A NEW LINK FORMAT for Multi-DB.
-        # Format: "get-CHANNELID-MSGID" ?
-        # But start.py needs to support it.
-        
-        # Current Start.py Logic:
-        # 1. "get-{generated_id}"
-        # 2. decoded_id = decode(token)
-        # 3. msg_id = decoded_id / abs(client.db)  <-- THIS IS THE BOTTLENECK.
-        
-        # To support Multi-DB, we MUST change start.py to handle "CHANNEL_ID-MSG_ID" format.
-        # Or "get-{encoded_string}" where encoded string contains both.
-        
-        # Proposed Format: "get-BatchFile-{channel_id}-{msg_id}"
-        # Or simple: "get-{channel_id}-{msg_id}" (if we can distinguish from old format)
-        
-        # Old Format: integer (huge)
-        # New Format: "CH_ID-MSG_ID" (string)
-        
-        channel_id = str(channel_id).replace("-100", "") # Remove prefix for shorter link
-        token_string = f"get-{channel_id}-{msg_id}" 
-        encoded_token = await encode(token_string)
-        
-        file_link = f"https://t.me/{client.username}?start={encoded_token}"
+        channel_id = int(channel_id)
+        if channel_id > 0:
+            channel_id = int(f"-100{channel_id}")
+    except Exception:
+        channel_id = int(client.db)
+
+    processing = await query.message.reply(f"⏳ {sc('sending your file')}...")
+
+    try:
+        msg = await client.get_messages(channel_id, msg_id)
+        if not msg or msg.empty:
+            await processing.edit(f"❌ {sc('file not found in database')}")
+            return
+
+        caption = (
+            client.messages.get('CAPTION', '').format(
+                previouscaption=(
+                    f"<blockquote>{msg.caption.html}</blockquote>" if msg.caption
+                    else f"<blockquote>{msg.document.file_name if msg.document else ''}</blockquote>"
+                )
+            )
+            if client.messages.get('CAPTION', '') and msg.document
+            else (msg.caption.html if msg.caption else "")
+        )
+
+        sent = await msg.copy(
+            chat_id=user_id,
+            caption=caption,
+            protect_content=client.protect
+        )
+
+        await processing.delete()
+
+        if client.auto_del > 0:
+            import humanize
+            from helper.helper_func import delete_files
+            import asyncio
+            warning = await query.message.reply(
+                f"<b>⚠️ {sc('file will be deleted in')} {humanize.naturaldelta(client.auto_del)}.</b>"
+            )
+            asyncio.create_task(delete_files([sent], client, warning, ""))
+
     except Exception as e:
-        client.LOGGER(__name__, client.name).warning(f"Error generating link: {e}")
-        file_link = f"https://t.me/{client.username}?start={file_id}"
-    
-    import humanize
-    timer_text = ""
-    if client.auto_del > 0:
-        timer_text = f"\n\n⏳ **{sc('warning')}:** {sc('file auto-deletes in')} {humanize.naturaldelta(client.auto_del)} {sc('after opening')}"
-    
-    await query.message.reply(
-        f"**📥 {file_data['quality']}**\n"
-        f"📄 {file_data['filename']}"
-        f"{timer_text}\n\n"
-        f"{sc('click below to access')}:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"📥 {sc('get file')}", url=file_link)]
-        ])
-    )
+        await processing.edit(f"❌ {sc('error')}: {e}")
+

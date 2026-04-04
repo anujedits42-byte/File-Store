@@ -1,25 +1,7 @@
-<p align="center">
-  <img src="https://i.ibb.co/gbVyYG8z/photo-2026-02-17-18-28-50-7607902977038221336.jpg" alt="Advanced File Store Bot Banner" width="100%">
-</p>
-
-<p align="center">
-  <img src="https://readme-typing-svg.herokuapp.com?font=Montserrat&weight=700&size=28&pause=1200&color=00BFFF&center=true&vCenter=true&width=750&lines=Advanced+File+Sharing+Bot;Premium+%7C+Multi-DB+%7C+Batch+System;Powered+by+Awakeners+Bots" />
-</p>
-
-<p align="center">
-  <img src="https://img.shields.io/github/stars/Awakener_Bots/file-sharing-bot?style=for-the-badge&color=00BFFF">
-  <img src="https://img.shields.io/github/forks/Awakener_Bots/file-sharing-bot?style=for-the-badge&color=00BFFF">
-  <img src="https://img.shields.io/badge/Python-3.8+-blue?style=for-the-badge">
-  <img src="https://img.shields.io/badge/MongoDB-Database-green?style=for-the-badge">
-</p>
-
----
-
+# Made by @Awakeners_Bots
 # Telegram File Sharing Bot
 
 A powerful Telegram bot for file sharing with advanced features including batch processing, premium memberships, multi-database channel support, URL shortening with token verification, and comprehensive admin controls.
-
----
 
 ## ✨ Features
 
@@ -30,6 +12,8 @@ A powerful Telegram bot for file sharing with advanced features including batch 
 - 💎 **Premium System** - Full subscription management with pricing tiers and expiry tracking
 - 🗄️ **Multi-DB Channels** - Round-robin file distribution across multiple database channels
 - 🔗 **URL Shortening** - Integrated URL shortener with multiple provider support
+- 🔐 **Hybrid Token System** - Secure, random 12-16 char token links with full backward compatibility for legacy Base64 links.
+
 
 ### Admin Features
 - 👥 **Premium User Management** - Control panel to add/remove premium users with expiry dates
@@ -45,8 +29,6 @@ A powerful Telegram bot for file sharing with advanced features including batch 
 - 🔔 **Notifications** - Auto-notify users on premium status changes
 - 📱 **Mobile Friendly** - Responsive design for all devices
 
----
-
 ## 📋 Requirements
 
 - Python 3.8+
@@ -54,108 +36,171 @@ A powerful Telegram bot for file sharing with advanced features including batch 
 - Telegram Bot Token (from @BotFather)
 - Telegram API ID and Hash (from my.telegram.org)
 
----
-
 ## 🚀 Installation
 
-### 1️⃣ Clone the Repository
+### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/Awakener_Bots/file-sharing-bot
 cd file-sharing-bot
 ```
 
-### 2️⃣ Install Dependencies
+### 2. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3️⃣ Configuration
+### 3. Configuration
 
-Create a `config.py` file:
+Create a `config.py` file based on `.env.example`:
 
 ```python
-API_ID = 12345678
+# Bot Configuration
+API_ID = 12345678  # Get from my.telegram.org
 API_HASH = "your_api_hash"
 BOT_TOKEN = "your_bot_token"
 
+# Database
 DATABASE_URI = "mongodb://localhost:27017"
 DATABASE_NAME = "file_sharing_bot"
 
-DB_CHANNEL = -1001234567890
-FORCE_SUB_CHANNELS = []
+# Channels
+DB_CHANNEL = -1001234567890  # Main database channel ID
+FORCE_SUB_CHANNELS = []  # List of channel IDs for force subscribe
 
-OWNER_ID = 123456789
-ADMINS = [123456789]
+# Admin
+OWNER_ID = 123456789  # Your Telegram user ID
+ADMINS = [123456789]  # List of admin user IDs
 
+# Optional
 PORT = 8080
 WEBHOOK = False
 ```
 
-### 4️⃣ Run the Bot
+### 4. Run the Bot
 
 ```bash
 python bot.py
 ```
 
----
-
 ## 📝 Commands
 
 ### User Commands
-- `/start`
-- `/about`
-- `/premium`
-- `/mypremium`
+- `/start` - Start the bot
+- `/about` - About the bot
+- `/premium` - View premium plans
+- `/mypremium` - Check your premium status
 
 ### Admin Commands
-- `/batch`
-- `/genlink`
-- `/autobatch`
-- `/broadcast`
-- `/stats`
-- `/addpremium <user_id> [days]`
-- `/removepremium <user_id>`
-- `/settings`
+- `/batch` - Create manual batch
+- `/genlink` - Generate link for single file
+- `/autobatch` - Configure auto-batch settings
+- `/broadcast` - Broadcast message to all users
+- `/stats` - View bot statistics
+- `/addpremium <user_id> [days]` - Add premium to user
+- `/removepremium <user_id>` - Remove premium from user
+- `/settings` - Access bot settings panel
 
----
+## ⚙️ Features Configuration
+
+### Multi-DB Channel System
+1. Go to Settings → 🗄️ DB Channels
+2. Toggle **Enable Multi-DB**
+3. Add extra database channels
+4. Files will be distributed automatically using round-robin
+
+### Premium System
+- Configure pricing tiers in `plugins/premium.py`
+- Users can view plans with `/premium` command
+- Admins manage subscriptions with `/addpremium` and `/removepremium`
+
+### Auto Batch
+- Automatically groups files by episode or season
+- Configurable time window and grouping mode
+- Toggle on/off from Settings → 🤖 Auto Batch
+
+### URL Shortener
+- Supports multiple shortener providers
+- Token verification system
+- Anti-bypass protection
+- Configure in Settings → URL Shorteners
 
 ## 🗂️ Project Structure
 
 ```
 file-sharing-bot/
-├── bot.py
-├── config.py
-├── requirements.txt
-├── plugins/
-├── helper/
-└── README.md
+├── bot.py                 # Main bot file
+├── config.py             # Configuration (create from .env.example)
+├── requirements.txt      # Python dependencies
+├── plugins/              # Bot plugins
+│   ├── start.py         # Start command and file serving
+│   ├── batch_handler.py # Batch processing
+│   ├── premium.py       # Premium system
+│   ├── settings.py      # Settings panel
+│   ├── credit.py        # Credit system
+│   └── ...
+├── helper/              # Helper modules
+│   ├── database.py     # MongoDB operations
+│   ├── font_converter.py # Small caps conversion
+│   └── ...
+└── README.md           # This file
 ```
 
----
+## 🎨 UI Customization
 
-## 👨‍💻 ᴄʀᴇᴅɪᴛs
+All user-facing text uses small caps font with blockquote styling for a premium look:
 
-**ᴅᴇᴠᴇʟᴏᴘᴇʀ**
+```python
+from helper.font_converter import to_small_caps as sc
 
-» [ɢᴘɢ](https://github.com/GPG36)
+msg = f"""<blockquote>**{sc('title')}:**</blockquote>
 
-» [ᴋᴜɴᴀʟ](https://github.com/KunalG932)
+**{sc('field')}:** value
+"""
+```
 
-**ᴍᴀɪɴᴛᴀɪɴᴇᴅ ʙʏ**  
-» [ᴀᴡᴀᴋᴇɴᴇʀs ʙᴏᴛs](https://t.me/Awakeners_Bots)
+## 🔧 Advanced Configuration
 
-» [ᴠᴏᴀᴛ](t.me/Awakeners_bots) - [ʙᴀsᴇ ʀᴇᴘᴏ](https://github.com/ArihantSharma/FileStoreBot)
+### Force Subscribe
+Add channel IDs to `FORCE_SUB_CHANNELS` in config.py. Users must join these channels to access files.
+
+### Credit System
+- Configure credit costs per file
+- Users earn credits through URL shorteners
+- Admins can add/remove credits
+
+### Security
+- Token verification prevents bypassing shorteners
+- Configurable bypass detection timer
+- Admin-only sensitive commands
+
+## 📊 Database Schema
+
+The bot uses MongoDB with the following collections:
+- `users` - User data and statistics
+- `bot_config` - Bot configuration
+- `batches` - Batch information
+- `credits` - User credit balances
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## 📄 License
+
+This project is licensed under the MIT License.
+
+## 👨‍💻 Developer
+
+**Made by [@Awakeners_Bots](https://t.me/Awakeners_Bots)**
+
+For support and updates, join our channel!
+
 ## ⚠️ Disclaimer
 
-This bot is for educational purposes. Ensure compliance with Telegram's Terms of Service and local laws.
+This bot is for educational purposes. Ensure you comply with Telegram's Terms of Service and local laws when using this bot.
 
 ---
-<p align="center">
-  ᴍᴀᴅᴇ ᴡɪᴛʜ ❤️ ʙʏ <a href="https://t.me/Awakeners_Bots">ᴀᴡᴀᴋᴇɴᴇʀs ʙᴏᴛs</a>
-</p>
 
-<p align="center">
-⭐ Star this repository if you find it helpful!
-</p>
+**Star ⭐ this repository if you find it helpful!**

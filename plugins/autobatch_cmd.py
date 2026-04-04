@@ -26,7 +26,8 @@ async def autobatch_command(client: Client, message: Message):
     user_batch_state[user_id] = {
         'step': 'waiting_first',
         'first_msg_id': None,
-        'last_msg_id': None
+        'last_msg_id': None,
+        'chat_id': None
     }
     
     await show_autobatch_panel(client, message, is_edit=False)
@@ -184,28 +185,45 @@ async def handle_batch_links(client: Client, message: Message):
     # Extract message ID from link or forward
     msg_id = None
     
-    if message.forward_origin:
-        # Forwarded message
-        if message.forward_origin.type == "channel":
-            msg_id = message.forward_origin.message_id
-        elif message.forward_origin.type == "user":
-            # For user forwards, we probably don't have message_id in origin relevant to DB channel?
-            # But the logic expects a message ID to fetch content?
-            # Existing code used message.forward_from_message_id
-            # This attribute is usually present for channel forwards.
-            # Pyrogram documentation says forward_from_message_id is for channel posts.
-            # So checking forward_origin.type == "channel" is safer.
-            pass
-    elif message.text:
+    # Compat: support both new Pyrogram (forward_origin) and old (forward_from_message_id)
+    is_forward = False
+    try:
+        if hasattr(message, 'forward_origin') and message.forward_origin:
+            is_forward = True
+            if message.forward_origin.type == "channel":
+                msg_id = message.forward_origin.message_id
+        elif hasattr(message, 'forward_from_message_id') and message.forward_from_message_id:
+            is_forward = True
+            msg_id = message.forward_from_message_id
+    except Exception:
+        pass
+    
+    if not is_forward and message.text:
         # Message link - Handle whitespace and potential surrounding text
         # Regex looks for / followed by digits, optionally followed by non-digits
         # Example: https://t.me/c/123/456 or https://t.me/c/123/456?comment=1
         text = message.text.strip()
         
-        # Try to find the last occurrence of /number
+        # Try to find both chat_id and msg_id
+        # For private channel links (t.me/c/123/456), 123 is chat_id, 456 is msg_id
+        # For public links (t.me/channel/456), we might need to resolve 'channel'
         matches = re.findall(r'/(\d+)', text)
-        if matches:
+        if len(matches) >= 2:
+            # handle cases like t.me/c/12345/678
+            # The chat_id for private is usually preceded by /c/ and is positive in link, 
+            # but needs -100 prefix in Pyrogram
+            chat_id_val = matches[-2]
             msg_id = int(matches[-1])
+            
+            # If it's a private chat ID (standard for manual links)
+            if "/c/" in text:
+                chat_id = int(f"-100{chat_id_val}")
+            else:
+                # Public link or fallback
+                chat_id = int(chat_id_val)
+        elif matches:
+            msg_id = int(matches[-1])
+            chat_id = client.db # Fallback to primary DB if only one number found
     
     if not msg_id:
         # Don't reply if it's just a random message not intended for batching
@@ -217,10 +235,25 @@ async def handle_batch_links(client: Client, message: Message):
     # Handle based on current step
     if state['step'] == 'waiting_first':
         state['first_msg_id'] = msg_id
+        # Update chat_id if we successfully extracted it
+        if 'chat_id' in locals() and chat_id:
+            state['chat_id'] = chat_id
+        elif is_forward:
+            # Extract chat_id from forward
+            try:
+                if hasattr(message, 'forward_origin') and message.forward_origin:
+                    if message.forward_origin.type == "channel":
+                        state['chat_id'] = message.forward_origin.chat.id
+                elif hasattr(message, 'forward_from_chat') and message.forward_from_chat:
+                    state['chat_id'] = message.forward_from_chat.id
+            except:
+                pass
+        
         state['step'] = 'waiting_last'
         
+        chat_info = f" in `{state['chat_id']}`" if state['chat_id'] else ""
         await message.reply(
-            f"✅ {sc('first message received')}: `{msg_id}`\n\n"
+            f"✅ {sc('first message received')}: `{msg_id}`{chat_info}\n\n"
             f"{sc('now send the last message link or forward the last message')}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"❌ {sc('cancel process')}", callback_data="autobatch_cancel")]
@@ -281,16 +314,16 @@ async def handle_batch_mode(client: Client, query):
     await query.message.edit_text(f"🔄 {sc('processing messages')}...")
     
     try:
-        await process_batch_range(client, query.message, state['first_msg_id'], state['last_msg_id'], mode)
+        await process_batch_range(client, query.message, state['first_msg_id'], state['last_msg_id'], mode, state['chat_id'])
     finally:
         if user_id in user_batch_state:
             del user_batch_state[user_id]
 
-async def process_batch_range(client: Client, message: Message, first_id: int, last_id: int, mode: str = "episode"):
+async def process_batch_range(client: Client, message: Message, first_id: int, last_id: int, mode: str = "episode", chat_id: int = None):
     """Process message range and create batch"""
     
-    # Get DB channel ID from config
-    db_channel_id = client.db_channel_id
+    # Get DB channel ID from state or default config
+    db_channel_id = chat_id or client.db_channel_id
     
     files_by_group = {}
     total_files = 0
@@ -340,7 +373,8 @@ async def process_batch_range(client: Client, message: Message, first_id: int, l
                 files_by_group[group_key].append({
                     'file_id': str(msg_id),
                     'filename': filename,
-                    'quality': quality
+                    'quality': quality,
+                    'channel_id': db_channel_id
                 })
                 
                 total_files += 1
@@ -397,7 +431,13 @@ async def process_batch_range(client: Client, message: Message, first_id: int, l
             result_msg = f"**✅ {sc('batch creation complete')}**\n"
             result_msg += f"**{sc('mode')}:** {sc(mode + ' batching')}\n"
             result_msg += f"**{sc('files scanned')}:** {total_files}\n"
-            result_msg += f"**{sc('batches created')}:** {batches_created}\n\n"
+            result_msg += f"**{sc('batches created')}:** {batches_created}\n"
+            
+            if client.auto_del > 0:
+                import humanize
+                result_msg += f"**⏳ {sc('auto delete')}:** {humanize.naturaldelta(client.auto_del)}\n"
+            
+            result_msg += "\n"
             
             for batch in batch_links[:10]:  # Show first 10
                 result_msg += f"**📦 {batch['name'][:40]}**\n"

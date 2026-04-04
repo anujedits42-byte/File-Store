@@ -101,7 +101,8 @@ async def add_new_admins(client: Client, query: CallbackQuery):
         for identifier in ids:
             if int(identifier) not in client.admins:
                 client.admins.append(int(identifier))
-            
+        # 💾 Save to MongoDB
+        await client.mongodb.save_admins(client.admins)
     except Exception as e:
         return await ids_msg.reply(f"Error: {e}")
     await admins(client, query)
@@ -122,6 +123,8 @@ async def remove_admins(client: Client, query: CallbackQuery):
                 continue
             if int(identifier) in client.admins:
                 client.admins.remove(int(identifier))
+        # 💾 Save to MongoDB
+        await client.mongodb.save_admins(client.admins)
     except Exception as e:
         return await ids_msg.reply(f"Error: {e}")
     await admins(client, query)

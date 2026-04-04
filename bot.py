@@ -169,11 +169,49 @@ class Bot(Client):
         
         self.username = usr_bot_me.username
         
+        # 🔐 Ensure MongoDB indexes for hybrid token system
+        try:
+            await self.mongodb.ensure_token_indexes()
+            self.LOGGER(__name__, self.name).info("Token indexes ensured.")
+        except Exception as e:
+            self.LOGGER(__name__, self.name).warning(f"Failed to create token indexes: {e}")
+            
+        # 🔄 Load Dynamic Configs (Auto-Del, ForceSub, Admins)
+        try:
+            stored_auto_del = await self.mongodb.get_bot_config('auto_del')
+            if stored_auto_del is not None:
+                self.auto_del = int(stored_auto_del)
+                self.LOGGER(__name__, self.name).info(f"Loaded Auto-Del from DB: {self.auto_del}s")
+        except Exception as e:
+             self.LOGGER(__name__, self.name).warning(f"Failed to load auto_del config: {e}")
+        
+        # 📌 Load persisted ForceSub channels (overrides setup.json defaults)
+        try:
+            saved_fsub = await self.mongodb.load_fsub_channels()
+            if saved_fsub:
+                self.fsub_dict = saved_fsub
+                self.LOGGER(__name__, self.name).info(f"Loaded {len(saved_fsub)} fsub channels from DB.")
+        except Exception as e:
+            self.LOGGER(__name__, self.name).warning(f"Failed to load fsub channels from DB: {e}")
+        
+        # 👑 Load persisted Admin list (overrides setup.json defaults, always keeps OWNER)
+        try:
+            saved_admins = await self.mongodb.load_admins()
+            if saved_admins:
+                # Always ensure owner is in the list
+                if OWNER_ID not in saved_admins:
+                    saved_admins.append(OWNER_ID)
+                self.admins = saved_admins
+                self.LOGGER(__name__, self.name).info(f"Loaded {len(saved_admins)} admins from DB.")
+        except Exception as e:
+            self.LOGGER(__name__, self.name).warning(f"Failed to load admins from DB: {e}")
+        
         try:
             asyncio.create_task(self._broadcast_ttl_worker())
             asyncio.create_task(self._credit_expiry_worker())
         except Exception as e:
             self.LOGGER(__name__, self.name).warning(f"Failed to start background workers: {e}")
+
 
     async def stop(self, *args):
         await super().stop()
