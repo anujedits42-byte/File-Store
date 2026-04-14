@@ -7,7 +7,7 @@ OWNER_ID = 7892805795
 MSG_EFFECT = 5046509860389126442
 
 # VPLink URL Shortener Configuration
-VPLINK_API_TOKEN = ""
+VPLINK_API_TOKEN = "b607119b9c4dff9f45d3345f97498899175c9485"
 VPLINK_API_URL = "https://vplink.in/api"
 
 # URL Shortener Providers Configuration
