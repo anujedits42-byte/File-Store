@@ -3,7 +3,7 @@ from logging.handlers import RotatingFileHandler
 
 LOG_FILE_NAME = "bot.log"
 PORT = '8080'
-OWNER_ID = 1234567890
+OWNER_ID = 7892805795
 MSG_EFFECT = 5046509860389126442
 
 # VPLink URL Shortener Configuration
