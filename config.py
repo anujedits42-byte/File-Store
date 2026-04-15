@@ -15,7 +15,7 @@ URL_SHORTENERS = {
     'vplink': {
         'name': 'VPLink',
         'api_url': 'https://vplink.in/api',
-        'api_token': VPLINK_API_TOKEN,
+        'api_token': "b607119b9c4dff9f45d3345f97498899175c9485,
         'format': 'text',
         'active': True
     }
